@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from parser import (
     extract_product_id,
+    extract_product_ids,
     normalize_creator,
     normalize_product,
     normalize_video,
@@ -182,70 +183,112 @@ if scan:
         detail_progress = st.progress(0.0)
         details = detail_map(client, ids, region, status, detail_progress)
 
-        # First try the cheap batch/feed payloads. TikHub's documented Shop
-        # detection path, however, is fetch_one_video_v2 ->
-        # data[0].share_info.share_url -> placeholder_product_id. Batch payloads
-        # do not always retain that commerce query parameter, so any unresolved
-        # video gets a V2 product-aware check.
-        product_ids: set[str] = set()
-        merged_video_dicts: dict[str, dict[str, Any]] = {}
+        # Product detection is intentionally multi-source. TikTok frequently
+        # moves Shop attachment metadata between app/web payloads. We scan the
+        # complete payload from each source and stop as soon as a candidate is
+        # found. Product candidates are validated by the product-detail call.
+        product_candidates_by_video: dict[str, list[str]] = {}
+        detection_source: dict[str, str] = {}
+        diagnostics: dict[str, Any] = {}
+
+        def remember(vid: str, source: str, payload: Any) -> bool:
+            candidates = extract_product_ids(payload)
+            if candidates:
+                product_candidates_by_video[vid] = candidates
+                detection_source[vid] = source
+                return True
+            return False
+
         unresolved: list[str] = []
         for vid in ids:
             base = feed_map.get(vid, {})
             detail = details.get(vid, {})
-            merged = detail or base
-            merged_video_dicts[vid] = merged
-            pid = extract_product_id(merged) or extract_product_id(base)
-            if pid:
-                product_ids.add(pid)
-            else:
-                unresolved.append(vid)
+            if remember(vid, "feed", base) or remember(vid, "batch", detail):
+                continue
+            unresolved.append(vid)
 
         if unresolved:
             status.write(
-                f"{len(unresolved)} videos need a Shop metadata check. "
-                "Checking TikHub V2 commerce data…"
+                f"{len(unresolved)} videos need deeper Shop detection. "
+                "Checking app + TikTok Web commerce metadata…"
             )
             commerce_progress = st.progress(0.0)
+            still_unresolved: list[str] = []
             for index, vid in enumerate(unresolved, start=1):
-                try:
-                    commerce_detail = client.single_video_product_detail(vid)
-                    if commerce_detail:
-                        merged_video_dicts[vid] = commerce_detail
-                        pid = extract_product_id(commerce_detail)
-                        if pid:
-                            product_ids.add(pid)
-                except TikHubError:
-                    # Keep the video in the results even if one commerce lookup fails.
-                    pass
+                found = False
+                checks = [
+                    ("app_v2", lambda: client._request(
+                        "GET", "/api/v1/tiktok/app/v3/fetch_one_video_v2",
+                        params={"aweme_id": vid}
+                    )),
+                    ("app_v3_region", lambda: client.app_video_detail_v3(vid, region)),
+                    ("web_v2", lambda: client.web_video_detail_v2(vid, region)),
+                    ("web_v1", lambda: client.web_video_detail(vid, region)),
+                ]
+                last_payload = None
+                for source, fn in checks:
+                    try:
+                        payload = fn()
+                        last_payload = payload
+                        if remember(vid, source, payload):
+                            found = True
+                            break
+                    except TikHubError as exc:
+                        diagnostics.setdefault(vid, {})[source + "_error"] = str(exc)
+                if not found:
+                    still_unresolved.append(vid)
+                    if last_payload is not None and len(diagnostics) < 5:
+                        diagnostics.setdefault(vid, {})["last_payload"] = last_payload
                 commerce_progress.progress(index / max(len(unresolved), 1))
 
-        status.write(f"Detected {len(product_ids)} unique tagged products. Loading product details…")
-        product_progress = st.progress(0.0)
-        unique_ids = sorted(product_ids)
-        for index, pid in enumerate(unique_ids, start=1):
+        # Validate candidate IDs through the Shop product endpoint. This filters
+        # out unrelated numeric IDs that can appear inside generic anchor data.
+        product_payloads: dict[str, dict[str, Any]] = {}
+        validated_pid_by_video: dict[str, str] = {}
+        all_candidate_ids = list(dict.fromkeys(
+            pid for vid in ids for pid in product_candidates_by_video.get(vid, [])[:4]
+        ))
+        status.write(
+            f"Found {len(all_candidate_ids)} product-ID candidates. "
+            "Validating them against TikTok Shop…"
+        )
+        validation_progress = st.progress(0.0)
+        validation_cache: dict[str, bool] = {}
+        for idx, pid in enumerate(all_candidate_ids, start=1):
             cached = get_cached_product(pid, region)
             if cached is not None:
-                payload = cached
+                product_payloads[pid] = cached
+                validation_cache[pid] = True
             else:
                 try:
                     payload = client.product_detail(pid, region)
+                    product_payloads[pid] = payload
                     set_cached_product(pid, region, payload)
-                except TikHubError as exc:
-                    payload = {"data": {}, "_error": str(exc)}
-            product_payloads[pid] = payload
-            product_progress.progress(index / max(len(unique_ids), 1))
-        if not unique_ids:
-            product_progress.progress(1.0)
+                    validation_cache[pid] = True
+                except TikHubError:
+                    validation_cache[pid] = False
+            validation_progress.progress(idx / max(len(all_candidate_ids), 1))
+        if not all_candidate_ids:
+            validation_progress.progress(1.0)
 
         for vid in ids:
+            for pid in product_candidates_by_video.get(vid, [])[:4]:
+                if validation_cache.get(pid):
+                    validated_pid_by_video[vid] = pid
+                    break
+
+        product_ids = set(validated_pid_by_video.values())
+        st.session_state["scan_detection_source"] = detection_source
+        st.session_state["scan_diagnostics"] = diagnostics
+        status.write(f"Detected {len(product_ids)} unique tagged products.")
+        for vid in ids:
             feed = feed_map[vid]
-            detail = merged_video_dicts.get(vid, feed)
             video_row = normalize_video(feed, creator)
-            pid = extract_product_id(detail) or extract_product_id(feed)
+            pid = validated_pid_by_video.get(vid)
             if pid:
                 product_row = normalize_product(pid, product_payloads.get(pid, {}), region)
                 product_row["product_status"] = "Tagged product"
+                product_row["detection_source"] = detection_source.get(vid, "")
             else:
                 product_row = {
                     "product_id": "",
@@ -261,6 +304,7 @@ if scan:
                     "product_url": "",
                     "region": region,
                     "product_status": "No product",
+                    "detection_source": "",
                 }
             rows.append({**video_row, **product_row})
 
@@ -310,6 +354,25 @@ if "scan_df" in st.session_state:
 
     with tabs[1]:
         display_products(df)
+
+    with st.expander("Detection diagnostics"):
+        st.caption("Useful only if TikTok still hides Shop metadata for a video. No API key is included.")
+        sources = st.session_state.get("scan_detection_source", {})
+        if sources:
+            source_counts = pd.Series(list(sources.values())).value_counts().rename_axis("source").reset_index(name="videos")
+            st.dataframe(source_counts, hide_index=True, use_container_width=True)
+        diagnostics = st.session_state.get("scan_diagnostics", {})
+        if diagnostics:
+            import json
+            diagnostic_json = json.dumps(diagnostics, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+            st.download_button(
+                "Download unresolved video diagnostics",
+                data=diagnostic_json,
+                file_name=f"{creator}_shop_detection_diagnostics.json",
+                mime="application/json",
+            )
+        else:
+            st.success("No unresolved diagnostic payloads were needed.")
 
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button(

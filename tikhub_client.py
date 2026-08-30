@@ -186,6 +186,31 @@ class TikHubClient:
             return data
         return None
 
+
+    def app_video_detail_v3(self, aweme_id: str, region: str) -> dict[str, Any]:
+        """Region-aware app metadata. TikHub added this as a separate V3 path."""
+        return self._request(
+            "GET",
+            "/api/v1/tiktok/app/v3/fetch_one_video_v3",
+            params={"aweme_id": aweme_id, "region": region},
+        )
+
+    def web_video_detail_v2(self, item_id: str, region: str) -> dict[str, Any]:
+        """TikHub's newer Web V2 response with more complete post metadata."""
+        return self._request(
+            "GET",
+            "/api/v1/tiktok/web/fetch_post_detail_v2",
+            params={"itemId": item_id, "region": region},
+        )
+
+    def web_video_detail(self, item_id: str, region: str) -> dict[str, Any]:
+        """Simpler Web response; final public metadata fallback."""
+        return self._request(
+            "GET",
+            "/api/v1/tiktok/web/fetch_post_detail",
+            params={"itemId": item_id, "region": region},
+        )
+
     def product_detail(self, product_id: str, region: str) -> dict[str, Any]:
         return self._request(
             "GET",

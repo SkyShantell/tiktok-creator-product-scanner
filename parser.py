@@ -1,13 +1,41 @@
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 PROFILE_RE = re.compile(r"(?:https?://)?(?:www\.)?tiktok\.com/@([^/?#]+)", re.I)
 VIDEO_ID_RE = re.compile(r"/video/(\d+)")
-PRODUCT_ID_RE = re.compile(r"(?:[?&]|^)placeholder_product_id=(\d+)")
+
+# TikTok has used several representations for a Shop attachment over time.
+PRODUCT_PATTERNS = [
+    re.compile(r"(?:placeholder_product_id|product_id|productId|product_id_str|productIdStr)[=\"':%3D\s]+(\d{10,})", re.I),
+    re.compile(r"(?:/product/|/pdp/)(?:[^/?#]*[-/])?(\d{10,})(?:[/?#&]|$)", re.I),
+    re.compile(r"(?:product%5[Ff]id|placeholder%5[Ff]product%5[Ff]id)%?3[Dd](\d{10,})", re.I),
+]
+
+DIRECT_PRODUCT_KEYS = {
+    "placeholder_product_id",
+    "product_id",
+    "productId",
+    "product_id_str",
+    "productIdStr",
+    "productid",
+}
+COMMERCE_PATH_WORDS = (
+    "product",
+    "commerce",
+    "ecom",
+    "shop",
+    "anchor",
+    "goods",
+    "affiliate",
+    "promotion",
+    "shopping",
+)
+GENERIC_ID_KEYS = {"id", "id_str", "idStr", "item_id", "itemId"}
 
 
 def normalize_creator(value: str) -> str:
@@ -49,6 +77,16 @@ def walk(obj: Any) -> Iterable[Any]:
             yield from walk(value)
 
 
+def walk_paths(obj: Any, path: tuple[str, ...] = ()) -> Iterable[tuple[tuple[str, ...], Any]]:
+    yield path, obj
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            yield from walk_paths(value, path + (str(key),))
+    elif isinstance(obj, list):
+        for idx, value in enumerate(obj):
+            yield from walk_paths(value, path + (str(idx),))
+
+
 def find_first_key(obj: Any, keys: set[str]) -> Any:
     for node in walk(obj):
         if isinstance(node, dict):
@@ -65,22 +103,13 @@ def extract_sec_user_id(payload: dict[str, Any]) -> str | None:
 
 def extract_video_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
     data = payload.get("data", payload)
-    preferred = deep_get(
-        data,
-        "aweme_list",
-        "item_list",
-        "items",
-        "videos",
-        "video_list",
-        default=None,
-    )
+    preferred = deep_get(data, "aweme_list", "item_list", "items", "videos", "video_list", default=None)
     if isinstance(preferred, list):
         return [x for x in preferred if isinstance(x, dict)]
 
     candidates: list[dict[str, Any]] = []
     for node in walk(data):
         if isinstance(node, dict) and any(k in node for k in ("aweme_id", "item_id", "id")):
-            # Avoid counting nested author/product dictionaries as videos.
             if any(k in node for k in ("video", "statistics", "stats", "desc", "description", "share_info")):
                 candidates.append(node)
     return dedupe_video_dicts(candidates)
@@ -116,49 +145,103 @@ def extract_pagination(payload: dict[str, Any]) -> tuple[bool, int | str | None]
     return bool(has_more), cursor
 
 
-def _share_urls(video: dict[str, Any]) -> list[str]:
-    urls: list[str] = []
-    direct = deep_get(video, "share_info.share_url", "shareInfo.shareUrl", "share_url", "shareUrl", default=None)
-    if isinstance(direct, str):
-        urls.append(direct)
-    for node in walk(video):
-        if isinstance(node, str) and "placeholder_product_id=" in node:
-            urls.append(node)
-    return list(dict.fromkeys(urls))
+def _valid_product_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    # Current TikTok Shop IDs are long numeric strings; this also rejects video
+    # IDs in most generic contexts unless they live under a commerce path.
+    if text.isdigit() and 10 <= len(text) <= 24:
+        return text
+    return None
 
 
-def extract_product_id(video: dict[str, Any]) -> str | None:
-    # TikHub's documented public-video method places the Shop product ID in
-    # share_info.share_url as placeholder_product_id=<id>.
-    for url in _share_urls(video):
-        match = PRODUCT_ID_RE.search(url)
-        if match:
-            return match.group(1)
+def _ids_from_text(text: str) -> list[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    variants = [text]
+    try:
+        decoded = unquote(text)
+        if decoded != text:
+            variants.append(decoded)
+        decoded2 = unquote(decoded)
+        if decoded2 not in variants:
+            variants.append(decoded2)
+    except Exception:
+        pass
+
+    out: list[str] = []
+    for variant in variants:
+        # Query string parsing catches normal share/product URLs.
         try:
-            values = parse_qs(urlparse(url).query).get("placeholder_product_id")
-            if values and str(values[0]).isdigit():
-                return str(values[0])
+            qs = parse_qs(urlparse(variant).query)
+            for key in ("placeholder_product_id", "product_id", "productId"):
+                for value in qs.get(key, []):
+                    pid = _valid_product_id(value)
+                    if pid:
+                        out.append(pid)
         except Exception:
             pass
+        for pattern in PRODUCT_PATTERNS:
+            for match in pattern.finditer(variant):
+                pid = _valid_product_id(match.group(1))
+                if pid:
+                    out.append(pid)
 
-    # Some TikTok payload variants expose commerce metadata as a direct
-    # product id rather than preserving placeholder_product_id in the URL.
-    # Prefer the placeholder id above, then fall back to known product-id keys.
-    direct = find_first_key(
-        video,
-        {
-            "placeholder_product_id",
-            "product_id",
-            "productId",
-            "product_id_str",
-            "productIdStr",
-        },
-    )
-    if direct is not None:
-        text = str(direct).strip()
-        if text.isdigit() and len(text) >= 8:
-            return text
-    return None
+        # Commerce metadata is often a JSON string nested inside `extra`,
+        # `anchor_info`, etc. Parse it if possible and scan recursively.
+        s = variant.strip()
+        if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+            try:
+                parsed = json.loads(s)
+                for pid in extract_product_ids(parsed):
+                    out.append(pid)
+            except Exception:
+                pass
+    return list(dict.fromkeys(out))
+
+
+def extract_product_ids(obj: Any) -> list[str]:
+    """Return plausible TikTok Shop product IDs from any TikTok response.
+
+    This deliberately accepts the *whole* TikHub response, not only the video
+    object. TikTok moves commerce fields between app/web response variants.
+    Candidates are later validated with TikHub's product-detail endpoint.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        pid = _valid_product_id(value)
+        if pid and pid not in seen:
+            seen.add(pid)
+            found.append(pid)
+
+    for path, node in walk_paths(obj):
+        if isinstance(node, dict):
+            path_text = ".".join(path).lower()
+            commerce_context = any(word in path_text for word in COMMERCE_PATH_WORDS)
+            for key, value in node.items():
+                key_lower = str(key).lower()
+                if key in DIRECT_PRODUCT_KEYS or key_lower in {k.lower() for k in DIRECT_PRODUCT_KEYS}:
+                    if isinstance(value, (str, int)):
+                        add(value)
+                elif key in GENERIC_ID_KEYS and commerce_context:
+                    if isinstance(value, (str, int)):
+                        add(value)
+                if isinstance(value, str):
+                    for pid in _ids_from_text(value):
+                        add(pid)
+        elif isinstance(node, str):
+            for pid in _ids_from_text(node):
+                add(pid)
+
+    return found
+
+
+def extract_product_id(obj: Any) -> str | None:
+    ids = extract_product_ids(obj)
+    return ids[0] if ids else None
 
 
 def extract_video_objects_from_batch(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -206,7 +289,6 @@ def unix_to_iso(value: Any) -> str | None:
     if n is None:
         return None
     try:
-        # milliseconds sometimes appear in APIs
         if n > 10_000_000_000:
             n = n / 1000
         return datetime.fromtimestamp(float(n), tz=timezone.utc).isoformat()
@@ -251,7 +333,6 @@ def normalize_product(product_id: str, payload: dict[str, Any], region: str) -> 
 
     title = _scalar_candidates(info, ("title", "product_name", "productName", "name"))
     description = _scalar_candidates(info, ("description", "desc", "product_description", "productDescription"))
-
     price = _scalar_candidates(info, ("sale_price", "salePrice", "price", "min_price", "minPrice"))
     currency = _scalar_candidates(info, ("currency", "currency_code", "currencyCode"))
     sold = _scalar_candidates(info, ("sold_count", "soldCount", "sales", "sale_count"))

@@ -1,72 +1,25 @@
-# TikTok Creator Product Scanner
+# TikTok Creator Product Scanner v3
 
-A Streamlit MVP that maps a TikTok creator's public videos to the TikTok Shop product attached to each video.
+Streamlit app: paste a public TikTok creator profile, retrieve their videos, detect the TikTok Shop product attached to each video, group products, and export CSV.
 
-## What it does
+## v3 detection changes
 
-1. Paste `@username` or a TikTok creator profile URL.
-2. Resolves the creator via TikHub.
-3. Pulls the newest 20/50/100/250/500 public videos.
-4. Inspects videos in TikHub batches of up to 10.
-5. Detects `placeholder_product_id` in each video's public share URL.
-6. Fetches TikTok Shop product details only once per unique product ID.
-7. Shows a Videos view and a grouped Products view.
-8. Exports CSV.
-9. Caches product payloads for 7 days in SQLite.
+TikTok moves Shop metadata between different response families. v3 no longer relies only on `share_info.share_url` / `placeholder_product_id`.
 
-## Setup
+For unresolved videos it tries, in order:
 
-### Local
+1. feed/batch metadata
+2. TikHub TikTok App V2 post detail
+3. TikHub TikTok App V3 region-aware post detail
+4. TikHub TikTok Web V2 post detail (newer richer metadata path)
+5. TikHub TikTok Web V1 post detail
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-# edit .env and set TIKHUB_API_KEY
-streamlit run app.py
-```
+It scans product/shop/commerce/anchor metadata for candidate product IDs, then validates candidates through TikHub's TikTok Shop product-detail endpoint before labeling a video as shoppable.
 
-### Streamlit Community Cloud
+A **Detection diagnostics** expander can export raw unresolved metadata for up to a few failed videos. It never includes the TikHub API key.
 
-Deploy the repo, then add this under **App settings → Secrets**:
+## Streamlit secret
 
 ```toml
-TIKHUB_API_KEY = "your_tikhub_api_key"
+TIKHUB_API_KEY = "your_key_here"
 ```
-
-Do not commit your real API key.
-
-## TikHub endpoints used
-
-- `GET /api/v1/tiktok/app/v3/get_user_id_and_sec_user_id_by_username`
-- `GET /api/v1/tiktok/app/v3/fetch_user_post_videos_v3`
-- `POST /api/v1/tiktok/app/v3/fetch_multi_video` (10 IDs per call)
-- `GET /api/v1/tiktok/app/v3/fetch_one_video_v3` (fallback only)
-- `GET /api/v1/tiktok/shop/web/fetch_product_detail_v3`
-
-## Detection method
-
-TikHub documents the public-video product signal as:
-
-`data[*].share_info.share_url` containing `placeholder_product_id=<TikTok Shop product id>`.
-
-This MVP deliberately uses that public method. It does **not** require a TikTok Creator cookie.
-
-## Notes / limitations
-
-- TikTok/TikHub response shapes can change. The parsers are intentionally defensive and support several common key variants.
-- A video with multiple associated products may need TikHub's Creator API "Video Associated Product List" endpoint, which requires Creator-cookie authentication. This MVP detects the public `placeholder_product_id` path only.
-- Product detail V3 requires the correct TikTok Shop region. Select the creator/product market in the UI.
-- SQLite cache is local to the deployment and may reset on hosts with ephemeral storage/redeploys.
-
-## Run tests
-
-```bash
-pip install pytest
-pytest -q
-```
-
-
-## Product detection
-The scanner first uses TikHub batch video calls for efficiency. If a video does not expose a product ID in the batch/feed payload, it automatically calls TikHub `fetch_one_video_v2`, which is the endpoint TikHub documents for detecting `placeholder_product_id` in `share_info.share_url`.
