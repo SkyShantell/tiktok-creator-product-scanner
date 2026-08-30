@@ -66,3 +66,7 @@ This MVP deliberately uses that public method. It does **not** require a TikTok 
 pip install pytest
 pytest -q
 ```
+
+
+## Product detection
+The scanner first uses TikHub batch video calls for efficiency. If a video does not expose a product ID in the batch/feed payload, it automatically calls TikHub `fetch_one_video_v2`, which is the endpoint TikHub documents for detecting `placeholder_product_id` in `share_info.share_url`.

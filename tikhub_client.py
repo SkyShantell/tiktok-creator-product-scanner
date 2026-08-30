@@ -156,8 +156,8 @@ class TikHubClient:
         for aweme_id in aweme_ids:
             payload = self._request(
                 "GET",
-                "/api/v1/tiktok/app/v3/fetch_one_video_v3",
-                params={"aweme_id": aweme_id, "region": region},
+                "/api/v1/tiktok/app/v3/fetch_one_video_v2",
+                params={"aweme_id": aweme_id},
             )
             extracted = extract_video_objects_from_batch(payload)
             if extracted:
@@ -165,6 +165,26 @@ class TikHubClient:
             elif isinstance(payload.get("data"), dict):
                 items.append(payload["data"])
         return items
+
+    def single_video_product_detail(self, aweme_id: str) -> dict[str, Any] | None:
+        """Fetch the V2 video payload TikHub documents for Shop product detection.
+
+        TikHub's product-detection guide specifically points to
+        $.data[0].share_info.share_url from fetch_one_video_v2, where a
+        shoppable video may include placeholder_product_id=<id>.
+        """
+        payload = self._request(
+            "GET",
+            "/api/v1/tiktok/app/v3/fetch_one_video_v2",
+            params={"aweme_id": aweme_id},
+        )
+        items = extract_video_objects_from_batch(payload)
+        if items:
+            return items[0]
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if isinstance(data, dict):
+            return data
+        return None
 
     def product_detail(self, product_id: str, region: str) -> dict[str, Any]:
         return self._request(

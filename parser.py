@@ -141,9 +141,23 @@ def extract_product_id(video: dict[str, Any]) -> str | None:
         except Exception:
             pass
 
-    direct = find_first_key(video, {"placeholder_product_id"})
-    if direct is not None and str(direct).isdigit():
-        return str(direct)
+    # Some TikTok payload variants expose commerce metadata as a direct
+    # product id rather than preserving placeholder_product_id in the URL.
+    # Prefer the placeholder id above, then fall back to known product-id keys.
+    direct = find_first_key(
+        video,
+        {
+            "placeholder_product_id",
+            "product_id",
+            "productId",
+            "product_id_str",
+            "productIdStr",
+        },
+    )
+    if direct is not None:
+        text = str(direct).strip()
+        if text.isdigit() and len(text) >= 8:
+            return text
     return None
 
 

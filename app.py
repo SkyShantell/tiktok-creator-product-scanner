@@ -182,19 +182,43 @@ if scan:
         detail_progress = st.progress(0.0)
         details = detail_map(client, ids, region, status, detail_progress)
 
-        # A detail response is preferred for product detection; feed data is the fallback.
+        # First try the cheap batch/feed payloads. TikHub's documented Shop
+        # detection path, however, is fetch_one_video_v2 ->
+        # data[0].share_info.share_url -> placeholder_product_id. Batch payloads
+        # do not always retain that commerce query parameter, so any unresolved
+        # video gets a V2 product-aware check.
         product_ids: set[str] = set()
         merged_video_dicts: dict[str, dict[str, Any]] = {}
+        unresolved: list[str] = []
         for vid in ids:
             base = feed_map.get(vid, {})
             detail = details.get(vid, {})
             merged = detail or base
             merged_video_dicts[vid] = merged
-            pid = extract_product_id(merged)
-            if not pid and detail is not base:
-                pid = extract_product_id(base)
+            pid = extract_product_id(merged) or extract_product_id(base)
             if pid:
                 product_ids.add(pid)
+            else:
+                unresolved.append(vid)
+
+        if unresolved:
+            status.write(
+                f"{len(unresolved)} videos need a Shop metadata check. "
+                "Checking TikHub V2 commerce data…"
+            )
+            commerce_progress = st.progress(0.0)
+            for index, vid in enumerate(unresolved, start=1):
+                try:
+                    commerce_detail = client.single_video_product_detail(vid)
+                    if commerce_detail:
+                        merged_video_dicts[vid] = commerce_detail
+                        pid = extract_product_id(commerce_detail)
+                        if pid:
+                            product_ids.add(pid)
+                except TikHubError:
+                    # Keep the video in the results even if one commerce lookup fails.
+                    pass
+                commerce_progress.progress(index / max(len(unresolved), 1))
 
         status.write(f"Detected {len(product_ids)} unique tagged products. Loading product details…")
         product_progress = st.progress(0.0)
