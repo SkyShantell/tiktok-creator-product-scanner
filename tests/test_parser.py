@@ -1,4 +1,4 @@
-from parser import extract_product_id, extract_product_ids, normalize_creator
+from parser import extract_product_id, extract_product_ids, normalize_creator, normalize_product
 
 
 def test_normalize_creator():
@@ -31,3 +31,15 @@ def test_product_url():
 def test_generic_anchor_id():
     obj = {"anchor_info": {"shopping_anchor": {"id": "17294069642063424"}}}
     assert "17294069642063424" in extract_product_ids(obj)
+
+
+def test_normalize_product_builds_shop_link_when_api_omits_it():
+    row = normalize_product("1729497312752277323", {"data": {"productInfo": {}}}, "US")
+    assert row["product_url"] == "https://shop.tiktok.com/view/product/1729497312752277323?region=US&locale=en"
+
+
+def test_normalize_product_prefers_returned_detail_link():
+    url = "https://shop.tiktok.com/view/product/1729497312752277323?region=US&locale=en-US"
+    payload = {"data": {"productInfo": {"detail_link": url}}}
+    row = normalize_product("1729497312752277323", payload, "US")
+    assert row["product_url"] == url

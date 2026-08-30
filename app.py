@@ -148,7 +148,15 @@ with st.form("scan_form"):
     )
     c1, c2 = st.columns(2)
     with c1:
-        video_limit = st.selectbox("Videos to scan", [20, 50, 100, 250, 500], index=2)
+        video_limit = st.number_input(
+            "Videos to scan",
+            min_value=1,
+            max_value=2000,
+            value=20,
+            step=1,
+            help="Enter the exact number of recent videos you want to scan.",
+        )
+        video_limit = int(video_limit)
     with c2:
         region = st.selectbox("TikTok Shop region", ["US", "GB", "SG", "MY", "PH", "TH", "VN", "ID"], index=0)
     scan = st.form_submit_button("Scan creator", type="primary", use_container_width=True)

@@ -23,3 +23,9 @@ A **Detection diagnostics** expander can export raw unresolved metadata for up t
 ```toml
 TIKHUB_API_KEY = "your_key_here"
 ```
+
+
+## v4 changes
+- `Videos to scan` is now an exact number input (1–2000).
+- Every validated product gets a direct TikTok Shop URL. If TikHub omits the URL, the app builds the canonical Shop product link from the validated product ID and region.
+- The direct product URL is clickable in both app views and included in `product_url` in CSV exports.

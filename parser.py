@@ -346,9 +346,16 @@ def normalize_product(product_id: str, payload: dict[str, Any], region: str) -> 
     if not seller:
         seller = _scalar_candidates(info, ("shop_name", "shopName", "seller_name", "sellerName"))
 
-    product_url = _scalar_candidates(info, ("product_url", "productUrl", "share_url", "shareUrl", "url"))
+    # Prefer a URL returned by TikTok/TikHub when it is present. V3 product
+    # payloads do not always expose the public PDP URL, so always fall back to
+    # TikTok Shop's canonical product-detail route. This keeps both the UI link
+    # and exported CSV usable for every validated product ID.
+    product_url = _scalar_candidates(
+        info,
+        ("detail_link", "detailLink", "product_link", "productLink", "product_url", "productUrl", "share_url", "shareUrl", "url"),
+    )
     if not isinstance(product_url, str) or not product_url.startswith("http"):
-        product_url = ""
+        product_url = f"https://shop.tiktok.com/view/product/{product_id}?region={region.upper()}&locale=en"
 
     return {
         "product_id": str(product_id),
