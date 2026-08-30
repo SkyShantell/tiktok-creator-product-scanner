@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from parser import (
     extract_product_id,
     extract_product_ids,
+    extract_product_title,
     normalize_creator,
     normalize_product,
     normalize_video,
@@ -294,7 +295,17 @@ if scan:
             video_row = normalize_video(feed, creator)
             pid = validated_pid_by_video.get(vid)
             if pid:
-                product_row = normalize_product(pid, product_payloads.get(pid, {}), region)
+                # The Shop detail payload can contain generic localization UI
+                # text in a `title` field. Feed/anchor commerce metadata often
+                # contains the real attached-product name, so use it as a
+                # fallback if the product-detail parser cannot find a good one.
+                fallback_title = (
+                    extract_product_title(feed, pid)
+                    or extract_product_title(details.get(vid, {}), pid)
+                )
+                product_row = normalize_product(
+                    pid, product_payloads.get(pid, {}), region, fallback_title=fallback_title
+                )
                 product_row["product_status"] = "Tagged product"
                 product_row["detection_source"] = detection_source.get(vid, "")
             else:

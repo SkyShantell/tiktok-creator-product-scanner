@@ -326,12 +326,153 @@ def _scalar_candidates(obj: Any, keys: tuple[str, ...]) -> Any:
     return None
 
 
-def normalize_product(product_id: str, payload: dict[str, Any], region: str) -> dict[str, Any]:
+GENERIC_PRODUCT_TITLE_SNIPPETS = (
+    "explore more from",
+    "{s_shopname}",
+    "shop now",
+    "visit shop",
+    "view shop",
+    "add to cart",
+    "buy now",
+    "recommended for you",
+)
+
+PRODUCT_TITLE_KEYS = {
+    "product_name", "productname", "product_title", "producttitle",
+    "display_name", "displayname", "title", "name",
+}
+
+
+def _clean_title(value: Any) -> str:
+    if not isinstance(value, (str, int, float)):
+        return ""
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    return text
+
+
+def _is_generic_product_title(value: Any) -> bool:
+    text = _clean_title(value)
+    if not text:
+        return True
+    low = text.lower()
+    if len(text) < 3 or len(text) > 500:
+        return True
+    if low.startswith(("http://", "https://")):
+        return True
+    if any(snippet in low for snippet in GENERIC_PRODUCT_TITLE_SNIPPETS):
+        return True
+    # TikTok occasionally returns localization/template strings instead of the
+    # product name. Curly-brace placeholders are a strong signal of that.
+    if "{" in text and "}" in text:
+        return True
+    return False
+
+
+def _best_product_title(obj: Any, *, commerce_only: bool = False) -> str | None:
+    """Pick the most product-like title instead of the first generic `title`.
+
+    TikTok Shop responses contain many nested `title`/`name` fields, including
+    UI copy such as `Explore more from {s_shopName}`. Scoring all candidates
+    prevents that template copy from replacing the actual product name.
+    """
+    candidates: list[tuple[int, int, str]] = []
+    for path, node in walk_paths(obj):
+        if not isinstance(node, dict):
+            continue
+        path_text = ".".join(path).lower()
+        commerce_context = any(word in path_text for word in COMMERCE_PATH_WORDS)
+        for key, raw in node.items():
+            key_lower = str(key).lower().replace("_", "")
+            if key_lower not in {k.replace("_", "") for k in PRODUCT_TITLE_KEYS}:
+                continue
+            title = _clean_title(raw)
+            if _is_generic_product_title(title):
+                continue
+            if commerce_only and not commerce_context and not any(
+                word in str(key).lower() for word in ("product", "goods", "item")
+            ):
+                continue
+
+            score = 0
+            raw_key = str(key).lower()
+            if "product" in raw_key and ("name" in raw_key or "title" in raw_key):
+                score += 120
+            elif "display" in raw_key and "name" in raw_key:
+                score += 95
+            elif raw_key == "title":
+                score += 75
+            elif raw_key == "name":
+                score += 55
+
+            if "product" in path_text or "goods" in path_text:
+                score += 65
+            if any(word in path_text for word in ("detail", "base_info", "basic_info", "pdp")):
+                score += 25
+            if any(word in path_text for word in ("anchor", "commerce", "ecom", "shopping")):
+                score += 20
+            if "shop" in path_text and "product" not in path_text:
+                score -= 45
+            if "seller" in path_text:
+                score -= 70
+            if any(word in path_text for word in ("recommend", "similar", "frequently", "category")):
+                score -= 55
+
+            # Actual product titles are normally descriptive, while tiny labels
+            # like "Details" or "Shop" are not.
+            score += min(len(title), 120) // 6
+            candidates.append((score, len(title), title))
+
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][2]
+
+
+def extract_product_title(obj: Any, product_id: str | None = None) -> str | None:
+    """Extract a product name from video/anchor commerce metadata when present."""
+    # If a product ID is supplied, prefer dictionaries in a commerce subtree
+    # that actually contain that ID. This avoids accidentally selecting the
+    # video's caption or the seller's display name.
+    if product_id:
+        pid = str(product_id)
+        localized: list[tuple[int, str]] = []
+        for path, node in walk_paths(obj):
+            if not isinstance(node, dict):
+                continue
+            try:
+                blob = json.dumps(node, ensure_ascii=False, default=str)
+            except Exception:
+                blob = str(node)
+            if pid not in blob:
+                continue
+            title = _best_product_title(node, commerce_only=False)
+            if title:
+                path_text = ".".join(path).lower()
+                score = 10 + (30 if any(w in path_text for w in COMMERCE_PATH_WORDS) else 0)
+                localized.append((score, title))
+        if localized:
+            localized.sort(reverse=True)
+            return localized[0][1]
+    return _best_product_title(obj, commerce_only=True)
+
+
+def normalize_product(
+    product_id: str,
+    payload: dict[str, Any],
+    region: str,
+    fallback_title: str | None = None,
+) -> dict[str, Any]:
     data = payload.get("data", payload)
     info = deep_get(data, "productInfo", "product_info", default=data) or {}
     shop = deep_get(data, "shopInfo", "shop_info", default={}) or {}
 
-    title = _scalar_candidates(info, ("title", "product_name", "productName", "name"))
+    # Do not use the first nested `title`; TikTok returns generic UI copy such
+    # as "Explore more from {s_shopName}" before the real product title.
+    title = _best_product_title(info) or _best_product_title(data)
+    if _is_generic_product_title(title):
+        title = None
+    if not title and fallback_title and not _is_generic_product_title(fallback_title):
+        title = _clean_title(fallback_title)
     description = _scalar_candidates(info, ("description", "desc", "product_description", "productDescription"))
     price = _scalar_candidates(info, ("sale_price", "salePrice", "price", "min_price", "minPrice"))
     currency = _scalar_candidates(info, ("currency", "currency_code", "currencyCode"))
