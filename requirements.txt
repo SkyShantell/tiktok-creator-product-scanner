@@ -2,3 +2,4 @@ streamlit>=1.37
 requests>=2.32
 pandas>=2.2
 python-dotenv>=1.0
+gspread>=6.0,<7
