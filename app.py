@@ -53,6 +53,7 @@ def get_api_key() -> str:
 
 
 def _group_conn() -> sqlite3.Connection:
+    """Open the group DB and migrate older creator_groups schemas in place."""
     conn = sqlite3.connect(GROUP_DB)
     conn.execute(
         """
@@ -63,6 +64,52 @@ def _group_conn() -> sqlite3.Connection:
         )
         """
     )
+
+    # v6 and earlier installs may already have creator_groups with a different
+    # creators column. CREATE TABLE IF NOT EXISTS does not change an existing
+    # SQLite schema, so migrate it safely instead of crashing on startup.
+    columns = {
+        str(row[1]): row
+        for row in conn.execute("PRAGMA table_info(creator_groups)").fetchall()
+    }
+
+    if "creators_json" not in columns:
+        conn.execute("ALTER TABLE creator_groups ADD COLUMN creators_json TEXT")
+        legacy_source = next(
+            (
+                col
+                for col in (
+                    "creators",
+                    "creator_list",
+                    "members_json",
+                    "handles_json",
+                    "creator_handles",
+                )
+                if col in columns
+            ),
+            None,
+        )
+        if legacy_source:
+            conn.execute(
+                f'UPDATE creator_groups SET creators_json = "{legacy_source}" '
+                "WHERE creators_json IS NULL OR creators_json = ''"
+            )
+        conn.execute(
+            "UPDATE creator_groups SET creators_json = '[]' "
+            "WHERE creators_json IS NULL OR creators_json = ''"
+        )
+
+    if "updated_at" not in columns:
+        conn.execute(
+            "ALTER TABLE creator_groups "
+            "ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0"
+        )
+        conn.execute(
+            "UPDATE creator_groups SET updated_at = strftime('%s','now') "
+            "WHERE updated_at = 0"
+        )
+
+    conn.commit()
     return conn
 
 
@@ -72,10 +119,20 @@ def load_groups() -> dict[str, list[str]]:
     result: dict[str, list[str]] = {}
     for name, payload in rows:
         try:
-            values = json.loads(payload)
-            result[str(name)] = [normalize_creator(x) for x in values]
+            values = json.loads(payload or "[]")
+            if not isinstance(values, list):
+                values = [values]
         except Exception:
-            continue
+            # Backward compatibility for older DBs that stored creators as
+            # comma/newline-delimited text instead of JSON.
+            values = [
+                x.strip()
+                for x in re.split(r"[\\n,]+", str(payload or ""))
+                if x.strip()
+            ]
+        clean = unique_creators([str(x) for x in values if str(x).strip()])
+        if clean:
+            result[str(name)] = clean
     return result
 
 
