@@ -52,70 +52,119 @@ def get_api_key() -> str:
         return ""
 
 
+def _migrate_legacy_groups(conn: sqlite3.Connection) -> None:
+    """Best-effort copy of old saved groups into the stable v2 table."""
+    try:
+        already = conn.execute(
+            "SELECT COUNT(*) FROM creator_groups_v2"
+        ).fetchone()[0]
+        if already:
+            return
+
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='creator_groups'"
+        ).fetchone()
+        if not exists:
+            return
+
+        columns = [
+            str(row[1])
+            for row in conn.execute(
+                "PRAGMA table_info(creator_groups)"
+            ).fetchall()
+        ]
+
+        name_col = next(
+            (c for c in ("name", "group_name", "title") if c in columns),
+            None,
+        )
+        creators_col = next(
+            (
+                c
+                for c in (
+                    "creators_json",
+                    "creators",
+                    "creator_list",
+                    "members_json",
+                    "handles_json",
+                    "creator_handles",
+                    "members",
+                )
+                if c in columns
+            ),
+            None,
+        )
+        if not name_col or not creators_col:
+            return
+
+        rows = conn.execute(
+            f'SELECT "{name_col}", "{creators_col}" FROM creator_groups'
+        ).fetchall()
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        for raw_name, raw_payload in rows:
+            name = re.sub(r"\s+", " ", str(raw_name or "").strip())
+            if not name:
+                continue
+
+            try:
+                values = json.loads(str(raw_payload or "[]"))
+                if not isinstance(values, list):
+                    values = [values]
+            except Exception:
+                values = [
+                    x.strip()
+                    for x in re.split(r"[\n,]+", str(raw_payload or ""))
+                    if x.strip()
+                ]
+
+            clean = unique_creators(
+                [str(x) for x in values if str(x).strip()]
+            )
+            if not clean:
+                continue
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO creator_groups_v2
+                    (name, creators_json, updated_at)
+                VALUES (?, ?, ?)
+                """,
+                (name, json.dumps(clean), now_ts),
+            )
+        conn.commit()
+    except sqlite3.Error:
+        return
+
+
 def _group_conn() -> sqlite3.Connection:
-    """Open the group DB and migrate older creator_groups schemas in place."""
+    """Use a stable v2 table so old SQLite schemas can never break startup."""
     conn = sqlite3.connect(GROUP_DB)
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS creator_groups (
+        CREATE TABLE IF NOT EXISTS creator_groups_v2 (
             name TEXT PRIMARY KEY,
             creators_json TEXT NOT NULL,
             updated_at INTEGER NOT NULL
         )
         """
     )
-
-    # v6 and earlier installs may already have creator_groups with a different
-    # creators column. CREATE TABLE IF NOT EXISTS does not change an existing
-    # SQLite schema, so migrate it safely instead of crashing on startup.
-    columns = {
-        str(row[1]): row
-        for row in conn.execute("PRAGMA table_info(creator_groups)").fetchall()
-    }
-
-    if "creators_json" not in columns:
-        conn.execute("ALTER TABLE creator_groups ADD COLUMN creators_json TEXT")
-        legacy_source = next(
-            (
-                col
-                for col in (
-                    "creators",
-                    "creator_list",
-                    "members_json",
-                    "handles_json",
-                    "creator_handles",
-                )
-                if col in columns
-            ),
-            None,
-        )
-        if legacy_source:
-            conn.execute(
-                f'UPDATE creator_groups SET creators_json = "{legacy_source}" '
-                "WHERE creators_json IS NULL OR creators_json = ''"
-            )
-        conn.execute(
-            "UPDATE creator_groups SET creators_json = '[]' "
-            "WHERE creators_json IS NULL OR creators_json = ''"
-        )
-
-    if "updated_at" not in columns:
-        conn.execute(
-            "ALTER TABLE creator_groups "
-            "ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0"
-        )
-        conn.execute(
-            "UPDATE creator_groups SET updated_at = strftime('%s','now') "
-            "WHERE updated_at = 0"
-        )
-
     conn.commit()
+    _migrate_legacy_groups(conn)
     return conn
 
 
 def load_groups() -> dict[str, list[str]]:
     with _group_conn() as conn:
-        rows = conn.execute("SELECT name, creators_json FROM creator_groups ORDER BY name COLLATE NOCASE").fetchall()
+        rows = conn.execute(
+            """
+            SELECT name, creators_json
+            FROM creator_groups_v2
+            ORDER BY name COLLATE NOCASE
+            """
+        ).fetchall()
+
     result: dict[str, list[str]] = {}
     for name, payload in rows:
         try:
@@ -123,14 +172,11 @@ def load_groups() -> dict[str, list[str]]:
             if not isinstance(values, list):
                 values = [values]
         except Exception:
-            # Backward compatibility for older DBs that stored creators as
-            # comma/newline-delimited text instead of JSON.
-            values = [
-                x.strip()
-                for x in re.split(r"[\\n,]+", str(payload or ""))
-                if x.strip()
-            ]
-        clean = unique_creators([str(x) for x in values if str(x).strip()])
+            values = []
+
+        clean = unique_creators(
+            [str(x) for x in values if str(x).strip()]
+        )
         if clean:
             result[str(name)] = clean
     return result
@@ -140,25 +186,34 @@ def save_group(name: str, creators: list[str]) -> None:
     name = re.sub(r"\s+", " ", (name or "").strip())
     if not name:
         raise ValueError("Enter a group name.")
+
     clean = unique_creators(creators)
     if not clean:
         raise ValueError("Add at least one creator to the group.")
+
+    now_ts = int(datetime.now(timezone.utc).timestamp())
     with _group_conn() as conn:
         conn.execute(
             """
-            INSERT INTO creator_groups(name, creators_json, updated_at)
-            VALUES (?, ?, strftime('%s','now'))
+            INSERT INTO creator_groups_v2
+                (name, creators_json, updated_at)
+            VALUES (?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
-              creators_json=excluded.creators_json,
-              updated_at=excluded.updated_at
+                creators_json=excluded.creators_json,
+                updated_at=excluded.updated_at
             """,
-            (name, json.dumps(clean)),
+            (name, json.dumps(clean), now_ts),
         )
+        conn.commit()
 
 
 def delete_group(name: str) -> None:
     with _group_conn() as conn:
-        conn.execute("DELETE FROM creator_groups WHERE name = ?", (name,))
+        conn.execute(
+            "DELETE FROM creator_groups_v2 WHERE name = ?",
+            (name,),
+        )
+        conn.commit()
 
 
 def unique_creators(values: list[str]) -> list[str]:
