@@ -11,6 +11,7 @@ from parser import (
     extract_sec_user_id,
     extract_video_list,
     extract_video_objects_from_batch,
+    deep_get,
     video_id,
 )
 
@@ -91,12 +92,20 @@ class TikHubClient:
         limit: int,
         *,
         progress: Callable[[int, int], None] | None = None,
+        posted_after: int | None = None,
     ) -> list[dict[str, Any]]:
+        """Return up to ``limit`` creator videos, optionally only recent ones.
+
+        TikTok creator feeds are newest-first. When ``posted_after`` is supplied,
+        older videos are discarded while paging and we stop as soon as a page
+        crosses the cutoff. This means product-detail/commerce calls are never
+        spent on videos outside the selected date window.
+        """
         sec_user_id = self.resolve_creator(username)
         cursor: int | str = 0
         collected: list[dict[str, Any]] = []
         seen: set[str] = set()
-        safety_pages = max(3, (limit // 20) + 5)
+        safety_pages = max(5, (limit // 20) + 8)
 
         for _ in range(safety_pages):
             params: dict[str, Any] = {
@@ -117,21 +126,47 @@ class TikHubClient:
             page = extract_video_list(payload)
             if not page:
                 break
+
+            crossed_cutoff = False
             for item in page:
                 vid = video_id(item)
-                if vid and vid not in seen:
-                    seen.add(vid)
-                    collected.append(item)
-                    if len(collected) >= limit:
-                        break
+                if not vid or vid in seen:
+                    continue
+                seen.add(vid)
+
+                raw_created = deep_get(
+                    item, "create_time", "createTime", "create_timestamp", default=None
+                )
+                try:
+                    created = int(float(raw_created)) if raw_created not in (None, "") else None
+                except (TypeError, ValueError):
+                    created = None
+
+                if posted_after is not None:
+                    # If a dated filter is active, do not spend downstream paid
+                    # calls on videos whose date cannot be verified.
+                    if created is None:
+                        continue
+                    if created < posted_after:
+                        crossed_cutoff = True
+                        continue
+
+                collected.append(item)
+                if len(collected) >= limit:
+                    break
+
             if progress:
                 progress(min(len(collected), limit), limit)
             if len(collected) >= limit:
                 break
+            if posted_after is not None and crossed_cutoff:
+                break
+
             has_more, next_cursor = extract_pagination(payload)
             if not has_more or next_cursor in (None, cursor):
                 break
             cursor = next_cursor
+
         return collected[:limit]
 
     def batch_video_details(self, aweme_ids: list[str], region: str = "US") -> list[dict[str, Any]]:
